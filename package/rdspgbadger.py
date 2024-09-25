@@ -8,6 +8,7 @@ report.
 
 import os
 import errno
+import urllib.parse
 import boto3
 from botocore.exceptions import (
     ClientError,
@@ -17,7 +18,9 @@ from botocore.exceptions import (
     PartialCredentialsError,
 )
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
+import hashlib, hmac, urllib
+import requests
 
 try:
     from shutil import which
@@ -89,12 +92,23 @@ def define_logger(verbose=False):
     logger.addHandler(consoleHandler)
 
 
+def get_session(profile_name=None, region_name=None):
+    session = boto3.Session(profile_name=profile_name, region_name=region_name)
+    return session
+
+
+def get_credentials(profile_name=None, region_name=None):
+    return get_session(profile_name, region_name).get_credentials()
+
+
 def get_all_logs(
     dbinstance_id, output, date=None, region=None, assume_role=None, profile=None
 ):
 
-    session_args = {"profile_name": profile, "region_name": region}
-    session = boto3.Session(**session_args)
+    session = get_session(profile_name=profile, region_name=region)
+
+    if region is None:
+        region = session.region_name
 
     rds_client = session.client("rds")
     if assume_role:
@@ -104,14 +118,21 @@ def get_all_logs(
         )
 
         credentials = assumed_role_object["Credentials"]
-        boto_args = {
-            "aws_access_key_id": credentials["AccessKeyId"],
-            "aws_secret_access_key": credentials["SecretAccessKey"],
-            "aws_session_token": credentials["SessionToken"],
-        }
-        logger.info("STS Assumed role %s", assume_role)
-        rds_client = boto3.client("rds", **boto_args)
 
+        access_key_id = credentials["AccessKeyId"]
+        secret_access_key = credentials["SecretAccessKey"]
+        session_token = credentials["SessionToken"]
+        logger.info("STS Assumed role %s", assume_role)
+        rds_client = boto3.client(
+            "rds",
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            aws_session_token=session_token,
+        )
+    else:
+        access_key_id = session.get_credentials().access_key
+        secret_access_key = session.get_credentials().secret_key
+        session_token = session.get_credentials().token
     paginator = rds_client.get_paginator("describe_db_log_files")
     response_iterator = paginator.paginate(
         DBInstanceIdentifier=dbinstance_id, FilenameContains="postgresql.log"
@@ -123,65 +144,173 @@ def get_all_logs(
             for name in response.get("DescribeDBLogFiles")
             if not date or date in name["LogFileName"]
         ):
-            filename = "{}/{}".format(output, log["LogFileName"])
-            logger.info("Downloading file %s", filename)
+            output_filename = "{}/{}".format(output, log["LogFileName"])
+            logger.info("Downloading file %s", output_filename)
             try:
-                os.remove(filename)
+                os.remove(output_filename)
             except OSError:
                 pass
-            write_log(rds_client, dbinstance_id, filename, log["LogFileName"])
+            write_log(
+                region,
+                access_key_id,
+                secret_access_key,
+                session_token,
+                log["LogFileName"],
+                dbinstance_id,
+                output_filename,
+            )
 
 
-def write_log(client, dbinstance_id, filename, logfilename):
-    marker = "0"
-    initial_max_number_of_lines = 10000
-    max_number_of_lines = initial_max_number_of_lines
-    truncated_string = " [Your log message was truncated]"
-    slice_length = len(truncated_string) + 1
+# adapted from https://gist.github.com/rams3sh/15ac9487f2b6860988dc5fb967e754aa
+def write_log(
+    region,
+    access_key_id,
+    secret_access_key,
+    session_token,
+    filename,
+    db_instance_identifier,
+    output_file,
+):
+    if not os.path.exists(os.path.dirname(output_file)):
+        try:
+            os.makedirs(os.path.dirname(output_file))
+        except OSError as exc:  # Guard against race condition
+            if exc.errno != errno.EEXIST:
+                raise
 
-    response = client.download_db_log_file_portion(
-        DBInstanceIdentifier=dbinstance_id,
-        LogFileName=logfilename,
-        Marker=marker,
-        NumberOfLines=max_number_of_lines,
+    def sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    def getSignatureKey(key, dateStamp, regionName, serviceName):
+        kDate = sign(("AWS4" + key).encode("utf-8"), dateStamp)
+        kRegion = sign(kDate, regionName)
+        kService = sign(kRegion, serviceName)
+        kSigning = sign(kService, "aws4_request")
+        return kSigning
+
+    # ************* REQUEST VALUES *************
+    method = "GET"
+    service = "rds"
+    region = region
+    host = "rds." + region + ".amazonaws.com"
+    endpoint = "https://" + host
+
+    # Key derivation functions. See:
+    # http://docs.aws.amazon.com/general/latest/gr/signature-v4-examples.html#signature-v4-examples-python
+    # credentials = get_credentials(profile_name=profile_name, region_name=region)
+    access_key = access_key_id
+    secret_key = secret_access_key
+    session_token = session_token
+    if access_key is None or secret_key is None:
+        logger.error("No access key is available in current environment. Exiting ..")
+        return
+
+    # Create a date for headers and the credential string
+    t = datetime.now(timezone.utc)
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")  # Format date as YYYYMMDD'T'HHMMSS'Z'
+    datestamp = t.strftime("%Y%m%d")  # Date w/o time, used in credential scope
+
+    # sample usage : '/v13/downloadCompleteLogFile/DBInstanceIdentifier/error/postgresql.log.2017-05-26-04'
+    canonical_uri = (
+        "/v13/downloadCompleteLogFile/" + db_instance_identifier + "/" + filename
     )
 
-    while True:
-        if not os.path.exists(os.path.dirname(filename)):
-            try:
-                os.makedirs(os.path.dirname(filename))
-            except OSError as exc:  # Guard against race condition
-                if exc.errno != errno.EEXIST:
-                    raise
-        with open(filename, "a") as logfile:
-            if "LogFileData" in response:
-                if truncated_string in response["LogFileData"][-slice_length:]:
-                    downloaded_lines = response["LogFileData"].count("\n")
-                    if downloaded_lines == 0:
-                        raise Exception("No line was downloaded in last portion!")
-                    max_number_of_lines = max(int(downloaded_lines / 2), 1)
-                    logger.info(
-                        "Log truncated, retrying portion with "
-                        "NumberOfLines = {0}".format(max_number_of_lines)
-                    )
-                else:
-                    max_number_of_lines = initial_max_number_of_lines
-                    marker = response["Marker"]
-                    logfile.write(response["LogFileData"])
+    # Step 3: Create the canonical headers and signed headers. Header names
+    # and value must be trimmed and lowercase, and sorted in ASCII order.
+    # Note trailing \n in canonical_headers.
+    # signed_headers is the list of headers that are being included
+    # as part of the signing process. For requests that use query strings,
+    # only "host" is included in the signed headers.
+    canonical_headers = "host:" + host + "\n"
+    signed_headers = "host"
 
-        if (
-            "LogFileData" in response
-            and not response["LogFileData"].rstrip("\n")
-            and not response["AdditionalDataPending"]
-        ):
-            break
+    # Match the algorithm to the hashing algorithm you use, either SHA-1 or
+    # SHA-256 (recommended)
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = datestamp + "/" + region + "/" + service + "/" + "aws4_request"
 
-        response = client.download_db_log_file_portion(
-            DBInstanceIdentifier=dbinstance_id,
-            LogFileName=logfilename,
-            Marker=marker,
-            NumberOfLines=max_number_of_lines,
+    # Step 4: Create the canonical query string. In this example, request
+    # parameters are in the query string. Query string values must
+    # be URL-encoded (space=%20). The parameters must be sorted by name.
+    canonical_querystring = ""
+    canonical_querystring += "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    canonical_querystring += "&X-Amz-Credential=" + urllib.parse.quote_plus(
+        access_key + "/" + credential_scope
+    )
+    canonical_querystring += "&X-Amz-Date=" + amz_date
+    canonical_querystring += "&X-Amz-Expires=30"
+    if session_token is not None:
+        canonical_querystring += "&X-Amz-Security-Token=" + urllib.parse.quote_plus(
+            session_token
         )
+    canonical_querystring += "&X-Amz-SignedHeaders=" + signed_headers
+
+    # Step 5: Create payload hash. For GET requests, the payload is an
+    # empty string ("").
+    payload_hash = hashlib.sha256("".encode("utf-8")).hexdigest()
+
+    # Step 6: Combine elements to create create canonical request
+    canonical_request = (
+        method
+        + "\n"
+        + canonical_uri
+        + "\n"
+        + canonical_querystring
+        + "\n"
+        + canonical_headers
+        + "\n"
+        + signed_headers
+        + "\n"
+        + payload_hash
+    )
+
+    # ************* TASK 2: CREATE THE STRING TO SIGN*************
+    string_to_sign = (
+        algorithm
+        + "\n"
+        + amz_date
+        + "\n"
+        + credential_scope
+        + "\n"
+        + hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+    )
+
+    # ************* TASK 3: CALCULATE THE SIGNATURE *************
+    # Create the signing key
+    signing_key = getSignatureKey(secret_key, datestamp, region, service)
+
+    # Sign the string_to_sign using the signing_key
+    signature = hmac.new(
+        signing_key, (string_to_sign).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+    # ************* TASK 4: ADD SIGNING INFORMATION TO THE REQUEST *************
+    # The auth information can be either in a query string
+    # value or in a header named Authorization. This code shows how to put
+    # everything into a query string.
+    canonical_querystring += "&X-Amz-Signature=" + signature
+
+    # ************* SEND THE REQUEST *************
+    # The 'host' header is added automatically by the Python 'request' lib. But it
+    # must exist as a header in the request.
+    request_url = endpoint + canonical_uri + "?" + canonical_querystring
+
+    r = requests.get(request_url, stream=True, allow_redirects=True)
+    if r.status_code != 200:
+        raise Exception("Something went wrong !! ")
+
+    error = False
+    error_resp = r.content
+    with open(output_file, "wb") as f:
+        for chunk in r.iter_content(100000):
+            if r.status_code != 200:
+                error = True
+                break
+            if chunk:
+                f.write(chunk)
+    if error:
+        os.remove(output_file)
+        raise Exception(str(error_resp))
 
 
 def main():
@@ -233,12 +362,12 @@ def main():
     else:
         logger.info("Generating PG Badger report.")
         command = (
-            '{} -p "%t:%r:%u@%d:[%p]:" {} -o {}/report.{} '
-            "{}/error/*.log.* ".format(
+            '{} -f rds -p "%t:%r:%u@%d:[%p]:" {} -o {}/report.{} '
+            "{}/error/*.log.*".format(
                 pgbadger, args.pgbadger_args, args.output, args.format, args.output
             )
         )
-        logger.debug("Command: %s", command)
+        logger.info("Command: %s", command)
         subprocess.call(command, shell=True)
         logger.info("Done")
 
