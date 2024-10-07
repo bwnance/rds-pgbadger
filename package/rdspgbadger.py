@@ -9,6 +9,7 @@ report.
 import os
 import errno
 import urllib.parse
+import shutil
 import boto3
 from botocore.exceptions import (
     ClientError,
@@ -137,7 +138,13 @@ def get_all_logs(
     response_iterator = paginator.paginate(
         DBInstanceIdentifier=dbinstance_id, FilenameContains="postgresql.log"
     )
-
+    # clear output folder and contents
+    try:
+        logger.info("Clearing output folder %s", output)
+        shutil.rmtree(output)
+    except OSError:
+        pass
+    os.makedirs(output)
     for response in response_iterator:
         for log in (
             name
